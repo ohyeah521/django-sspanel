@@ -1,23 +1,21 @@
 import datetime
 import random
-import re
 import time
 from decimal import Decimal
 from socket import timeout
 from urllib.parse import urlencode
 from uuid import uuid4
 
-import markdown
 import pendulum
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.utils import functional, timezone
 from redis.exceptions import LockError
-from slugify import slugify
+from trix_editor.fields import TrixEditorField
 
 from apps import constants as c
 from apps.ext import cache, encoder, lock, pay
@@ -30,7 +28,6 @@ from apps.utils import (
 
 
 class User(AbstractUser):
-
     MIN_PORT = 1025
     PORT_BLACK_SET = {6443, 8472}
 
@@ -49,7 +46,9 @@ class User(AbstractUser):
     level = models.PositiveIntegerField(
         verbose_name="用户等级", default=0, validators=[MinValueValidator(0)]
     )
-    level_expire_time = models.DateTimeField(verbose_name="等级有效期", default=timezone.now)
+    level_expire_time = models.DateTimeField(
+        verbose_name="等级有效期", default=timezone.now
+    )
     theme = models.CharField(
         verbose_name="主题",
         choices=c.THEME_CHOICES,
@@ -66,8 +65,12 @@ class User(AbstractUser):
     upload_traffic = models.BigIntegerField("上传流量", default=0)
     download_traffic = models.BigIntegerField("下载流量", default=0)
     total_traffic = models.BigIntegerField("总流量", default=settings.DEFAULT_TRAFFIC)
-    last_use_time = models.DateTimeField("上次使用时间", blank=True, db_index=True, null=True)
-    uid = models.UUIDField("uid", null=True, unique=True)  # NOTE 不要用用这个 uid 当主键，是有可能会变的
+    last_use_time = models.DateTimeField(
+        "上次使用时间", blank=True, db_index=True, null=True
+    )
+    uid = models.UUIDField(
+        "uid", null=True, unique=True
+    )  # NOTE 不要用用这个 uid 当主键，是有可能会变的
 
     class Meta(AbstractUser.Meta):
         verbose_name = "用户"
@@ -143,8 +146,8 @@ class User(AbstractUser):
             user_id_list = [user.id for user in expired_users]
             send_mail_to_users_task.delay(
                 user_id_list,
-                f"您的{settings.TITLE}账号已到期",
-                f"您的账号现被暂停使用。如需继续使用请前往 {settings.HOST} 充值",
+                f"您的{settings.SITE_TITLE}账号已到期",
+                f"您的账号现被暂停使用。如需继续使用请前往 {settings.SITE_HOST} 充值",
             )
 
     @classmethod
@@ -169,8 +172,8 @@ class User(AbstractUser):
             user_id_list = [user.id for user in out_of_traffic_users]
             send_mail_to_users_task.delay(
                 user_id_list,
-                f"您的{settings.TITLE}账号流量已全部用完",
-                f"您的账号现被暂停使用。如需继续使用请前往 {settings.HOST} 充值",
+                f"您的{settings.SITE_TITLE}账号流量已全部用完",
+                f"您的账号现被暂停使用。如需继续使用请前往 {settings.SITE_HOST} 充值",
             )
             print(f"共有{len(out_of_traffic_users)}个用户流量用超啦")
 
@@ -196,13 +199,13 @@ class User(AbstractUser):
     def sub_link(self):
         """订阅地址"""
         params = {"uid": self.uid}
-        return settings.HOST + f"/api/subscribe/?{urlencode(params)}"
+        return settings.SITE_HOST + f"/api/subscribe/?{urlencode(params)}"
 
     @property
     def ref_link(self):
         """ref地址"""
         params = {"ref": self.id}
-        return settings.HOST + f"/register/?{urlencode(params)}"
+        return settings.SITE_HOST + f"/register/?{urlencode(params)}"
 
     @property
     def today_is_checkin(self):
@@ -243,11 +246,29 @@ class User(AbstractUser):
     def remain_percentage(self):
         return 100.00 - self.used_percentage
 
+    def get_clash_proxy_provider_endpoint(self, native_ip=False):
+        params = {"uid": self.uid}
+        if native_ip:
+            params["native_ip"] = "true"
+        return (
+            settings.SITE_HOST
+            + f"/api/subscribe/clash/proxy_providers/?{urlencode(params)}"
+        )
+
     @property
-    def clash_proxy_provider_endpoint(self):
+    def direct_ip_rule_set_endpoint(self):
         params = {"uid": self.uid}
         return (
-            settings.HOST + f"/api/subscribe/clash/proxy_providers/?{urlencode(params)}"
+            settings.SITE_HOST
+            + f"/api/subscribe/clash/direct_ip_rule_set/?{urlencode(params)}"
+        )
+
+    @property
+    def direct_domain_rule_set_endpoint(self):
+        params = {"uid": self.uid}
+        return (
+            settings.SITE_HOST
+            + f"/api/subscribe/clash/direct_domain_rule_set/?{urlencode(params)}"
         )
 
     def update_proxy_config_from_dict(self, data):
@@ -258,7 +279,9 @@ class User(AbstractUser):
         try:
             self.save()
             return True
-        except ValidationError as e:
+        except ValidationError:
+            return False
+        except IntegrityError:
             return False
 
     def reset_traffic(self, new_traffic):
@@ -271,17 +294,23 @@ class User(AbstractUser):
         self.reset_traffic(settings.DEFAULT_TRAFFIC)
         self.save()
 
-    def get_sub_info_header(self):
+    def get_sub_info_header(self, for_android=False):
         """
         https://github.com/crossutility/Quantumult/blob/master/extra-subscription-feature.md
         """
-        expire = int(datetime.datetime.timestamp(self.level_expire_time))
-        info = f"upload={self.upload_traffic}; download={self.download_traffic}; total={self.total_traffic}; expire={expire}"
-        filename = slugify(settings.TITLE)
-        return {
-            "Subscription-Userinfo:": info,
-            "Content-Disposition": f'attachment; filename="{filename}.yaml"',
-        }
+        if for_android:
+            expire = int(self.level_expire_time.timestamp())
+            up = self.upload_traffic
+            down = self.download_traffic
+            total = self.total_traffic
+            info = f"upload={up}; download={down}; total={total}; expire={expire}"
+        else:
+            expire = self.level_expire_time.date().strftime("%Y-%m-%d")
+            up = traffic_format(self.upload_traffic)
+            down = traffic_format(self.download_traffic)
+            total = traffic_format(self.total_traffic)
+            info = f"u={up}; d={down}; t={total}; expire={expire}"
+        return {"Subscription-Userinfo": info}
 
     def reset_sub_uid(self):
         self.uid = str(uuid4())
@@ -295,7 +324,6 @@ class UserMixin:
 
 
 class UserSocialProfile(models.Model, UserMixin):
-
     TYPE_TG = "tg"
     TYPE_CHOICES = ((TYPE_TG, TYPE_TG),)
 
@@ -304,6 +332,7 @@ class UserSocialProfile(models.Model, UserMixin):
         "平台", default=TYPE_TG, choices=TYPE_CHOICES, max_length=32
     )
     platform_username = models.CharField("用户名", max_length=32)
+    platform_user_id = models.CharField("用户ID", max_length=32, null=True, blank=True)
     created_at = models.DateTimeField(
         auto_now_add=True, db_index=True, help_text="创建时间", verbose_name="创建时间"
     )
@@ -314,16 +343,18 @@ class UserSocialProfile(models.Model, UserMixin):
         verbose_name = "用户社交资料"
         verbose_name_plural = "用户社交资料"
         unique_together = [
-            ["platform", "platform_username"],
-            ["platform", "platform_username", "user_id"],
+            ["platform", "platform_user_id"],
+            ["platform", "platform_user_id", "user_id"],
         ]
 
     @classmethod
-    def get_or_create_and_update_info(cls, platform, username, data):
+    def get_or_create_and_update_info(
+        cls, platform, platform_user_id, platform_username, data
+    ):
         usp, _ = cls.objects.get_or_create(
             platform=platform,
-            platform_username=username,
-            defaults={"raw_auth_data": data},
+            platform_user_id=platform_user_id,
+            defaults={"raw_auth_data": data, "platform_username": platform_username},
         )
         # update auth info
         usp.raw_auth_data = data
@@ -335,17 +366,18 @@ class UserSocialProfile(models.Model, UserMixin):
         return cls.objects.filter(user_id=user_id)
 
     @classmethod
-    def get_by_platform(cls, platform, username):
-        return cls.objects.filter(platform=platform, platform_username=username).first()
+    def get_by_platform_user_id(cls, platform, platform_user_id):
+        return cls.objects.filter(
+            platform=platform, platform_user_id=platform_user_id
+        ).first()
 
     def bind(self, user):
         self.user_id = user.id
         self.save()
 
 
-class UserOrder(models.Model, UserMixin):
-
-    ALIPAY_CALLBACK_URL = f"{settings.HOST}/api/callback/alipay"
+class UserOrder(UserMixin, models.Model):
+    ALIPAY_CALLBACK_URL = f"{settings.SITE_HOST}/api/callback/alipay"
     DEFAULT_ORDER_TIME_OUT = "10m"
     STATUS_CREATED = 0
     STATUS_PAID = 1
@@ -378,7 +410,9 @@ class UserOrder(models.Model, UserMixin):
     class Meta:
         verbose_name = "用户订单"
         verbose_name_plural = "用户订单"
-        index_together = ["user", "status"]
+        indexes = [
+            models.Index(fields=["user", "status"]),
+        ]
 
     @classmethod
     def gen_out_trade_no(cls):
@@ -605,6 +639,11 @@ class InviteCode(models.Model):
     used = models.BooleanField(verbose_name="是否使用", default=False)
     created_at = models.DateTimeField(editable=False, auto_now_add=True)
 
+    @classmethod
+    def batch_create(cls, number, code_type):
+        models = [cls(code_type=code_type) for _ in range(number)]
+        cls.objects.bulk_create(models)
+
     def __str__(self):
         return f"<{self.user_id}>-<{self.code}>"
 
@@ -679,7 +718,6 @@ class RebateRecord(models.Model, UserMixin):
 
 
 class Donate(models.Model):
-
     user = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name="捐赠人")
     time = models.DateTimeField(
         "捐赠时间", editable=False, auto_now_add=True, db_index=True
@@ -728,7 +766,9 @@ class Donate(models.Model):
 class MoneyCode(models.Model):
     """充值码"""
 
-    user = models.CharField(verbose_name="用户名", max_length=128, blank=True, null=True)
+    user = models.CharField(
+        verbose_name="使用人", max_length=128, blank=True, null=True
+    )
     time = models.DateTimeField("捐赠时间", editable=False, auto_now_add=True)
     code = models.CharField(
         verbose_name="充值码",
@@ -738,7 +778,7 @@ class MoneyCode(models.Model):
         default=get_long_random_string,
     )
     number = models.DecimalField(
-        verbose_name="捐赠金额",
+        verbose_name="金额",
         decimal_places=2,
         max_digits=10,
         default=10,
@@ -752,20 +792,17 @@ class MoneyCode(models.Model):
         verbose_name_plural = "充值码"
         ordering = ("isused",)
 
-    def clean(self):
-        # 保证充值码不会重复
-        code_length = len(self.code or "")
-        if 0 < code_length < 12:
-            self.code = "{}{}".format(self.code, get_long_random_string())
-        else:
-            self.code = get_long_random_string()
-
     def __str__(self):
         return self.code
 
     @property
     def isused_cn(self):
         return "已使用" if self.isused else "未使用"
+
+    @classmethod
+    def batch_create(cls, number, amount):
+        models = [cls(number=amount) for _ in range(number)]
+        cls.objects.bulk_create(models)
 
 
 class Goods(models.Model):
@@ -776,7 +813,9 @@ class Goods(models.Model):
     STATUS_TYPE = ((STATUS_ON, "上架"), (STATUS_OFF, "下架"))
 
     name = models.CharField(verbose_name="商品名字", max_length=128, default="待编辑")
-    content = models.CharField(verbose_name="商品描述", max_length=256, default="待编辑")
+    content = models.CharField(
+        verbose_name="商品描述", max_length=256, default="待编辑"
+    )
     transfer = models.BigIntegerField(verbose_name="增加的流量", default=settings.GB)
     money = models.DecimalField(
         verbose_name="金额",
@@ -848,6 +887,11 @@ class Goods(models.Model):
             self.user_purchase_count > 0
             and PurchaseHistory.get_by_user_and_good(user, self).count()
             >= self.user_purchase_count
+        )
+
+    def user_already_buy(self, user: User):
+        return (
+            user.level >= self.level and user.level_expire_time > get_current_datetime()
         )
 
     @transaction.atomic
@@ -963,7 +1007,7 @@ class Announcement(models.Model):
     """公告"""
 
     time = models.DateTimeField("时间", auto_now_add=True)
-    body = models.TextField("主体")
+    body = TrixEditorField("主体")
 
     class Meta:
         verbose_name = "系统公告"
@@ -973,29 +1017,13 @@ class Announcement(models.Model):
     def __str__(self):
         return "日期:{}".format(str(self.time)[:9])
 
-    def save(self, *args, **kwargs):
-        md = markdown.Markdown(extensions=["markdown.extensions.extra"])
-        self.body = md.convert(self.body)
-        super(Announcement, self).save(*args, **kwargs)
-
     @classmethod
     def send_first_visit_msg(cls, request):
         anno = cls.objects.order_by("-time").first()
         if not anno or request.session.get("first_visit"):
             return
         request.session["first_visit"] = True
-        messages.warning(request, anno.plain_text, extra_tags="最新通知！")
-
-    @property
-    def plain_text(self):
-        # TODO 现在db里存的是md转换成的html，这里之后可能要优化。转换的逻辑移到前端去
-        re_br = re.compile("<br\s*?/?>")  # 处理换行
-        re_h = re.compile("</?\w+[^>]*>")  # HTML标签
-        s = re_br.sub("", self.body)  # 去掉br
-        s = re_h.sub("", s)  # 去掉HTML 标签
-        blank_line = re.compile("\n+")  # 去掉多余的空行
-        s = blank_line.sub("", s)
-        return s
+        messages.warning(request, anno.body, extra_tags="最新通知！")
 
 
 class Ticket(models.Model):
@@ -1011,11 +1039,19 @@ class Ticket(models.Model):
         verbose_name="状态", choices=TICKET_CHOICE, default=1
     )
     updated_at = models.DateTimeField(
-        auto_now=True, db_index=True, help_text="更新时间", verbose_name="更新时间"
+        auto_now=True,
+        db_index=True,
+        help_text="更新时间",
+        verbose_name="更新时间",
+        editable=False,
     )
 
     def __str__(self):
         return self.title
+
+    @property
+    def status_with_message_count(self):
+        return f"{self.get_status_display()} (回复数量:{self.messages.count()})"
 
     class Meta:
         verbose_name = "工单"
@@ -1025,11 +1061,53 @@ class Ticket(models.Model):
     @classmethod
     def close_stale_tickets(cls):
         dt = get_current_datetime().subtract(days=3)
-        tickets = cls.objects.filter(updated_at__lt=dt, status=1)
+        tickets = list(cls.objects.filter(updated_at__lt=dt, status=1))
         for t in tickets:
             t.title += " |3 天无更新自动关闭"
             t.status = -1
-            t.save()
+        cls.objects.bulk_update(tickets, ["title", "status"])
+
+    def add_message(self, user, message):
+        return TicketMessage.create_message(user, self, message)
+
+    def list_messages(self):
+        return self.messages.all()
+
+
+class TicketMessage(models.Model):
+    """工单回复"""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name="用户")
+    ticket = models.ForeignKey(
+        Ticket,
+        on_delete=models.CASCADE,
+        verbose_name="工单",
+        db_index=True,
+        related_name="messages",
+    )
+    message = models.TextField(verbose_name="内容主体")
+    created_at = models.DateTimeField(
+        verbose_name="时间", editable=False, auto_now_add=True
+    )
+
+    class Meta:
+        verbose_name = "工单回复"
+        verbose_name_plural = "工单回复"
+        ordering = ("ticket", "created_at")
+        indexes = [
+            models.Index(fields=["ticket", "created_at"]),
+        ]
+
+    @classmethod
+    def create_message(cls, user, ticket, message):
+        return cls.objects.create(user=user, ticket=ticket, message=message)
+
+    @property
+    def is_staff(self):
+        return self.user.is_staff
+
+    def __str__(self) -> str:
+        return f"{self.id}"
 
 
 class EmailSendLog(models.Model):
@@ -1043,7 +1121,3 @@ class EmailSendLog(models.Model):
     class Meta:
         verbose_name = "邮件发送记录"
         verbose_name_plural = "邮件发送记录"
-
-    @classmethod
-    def get_user_dict_by_subject(cls, subject):
-        return {l.user: 1 for l in cls.objects.filter(subject=subject)}

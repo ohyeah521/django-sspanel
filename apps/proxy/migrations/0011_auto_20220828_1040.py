@@ -5,7 +5,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("proxy", "0010_auto_20220827_1555"),
     ]
@@ -28,7 +27,9 @@ class Migration(migrations.Migration):
                 ),
                 (
                     "fallback_addr",
-                    models.CharField(default="", max_length=32, verbose_name="回落地址"),
+                    models.CharField(
+                        default="", max_length=32, verbose_name="回落地址"
+                    ),
                 ),
                 (
                     "multi_user_port",

@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("sspanel", "0013_remove_user_vmess_uuid"),
     ]
@@ -14,7 +13,10 @@ class Migration(migrations.Migration):
             model_name="ticket",
             name="updated_at",
             field=models.DateTimeField(
-                auto_now=True, db_index=True, help_text="更新时间", verbose_name="更新时间"
+                auto_now=True,
+                db_index=True,
+                help_text="更新时间",
+                verbose_name="更新时间",
             ),
         ),
     ]

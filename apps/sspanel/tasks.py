@@ -4,7 +4,7 @@ from django.conf import settings
 from django.core.mail import send_mail
 
 from apps import celery_app
-from apps.proxy.models import ProxyNode, UserTrafficLog
+from apps.proxy.models import ProxyNode, UserProxyNodeOccupancy, UserTrafficLog
 from apps.sspanel import models as m
 from apps.utils import get_current_datetime
 
@@ -25,34 +25,48 @@ def sync_user_traffic_task(node_id, data):
     3 记录节点在线IP
     4 关闭超出流量的节点
     """
-    node = ProxyNode.get_or_none(node_id)
+    node: ProxyNode = ProxyNode.get_or_none(node_id)
     if not node:
         return
+    node_occurred_user_ids = [
+        i["user_id"] for i in UserProxyNodeOccupancy.get_node_occupancy_user_ids(node)
+    ]
     node_total_traffic = 0
     log_time = get_current_datetime()
     user_model_list = []
     trafficlog_model_list = []
+    traffic_data = data.get("data", [])
 
     # load user in batch
     user_ids = []
-    for user_data in data:
+    for user_data in traffic_data:
         user_id = user_data["user_id"]
         user_ids.append(user_data["user_id"])
     user_map = {}
     for u in m.User.objects.filter(id__in=user_ids):
         user_map[u.id] = u
 
-    for user_data in data:
+    for user_data in traffic_data:
         user_id = int(user_data["user_id"])
+        user = user_map[user_id]
         u = int(int(user_data["upload_traffic"]) * node.enlarge_scale)
         d = int(int(user_data["download_traffic"]) * node.enlarge_scale)
-        # 个人流量增量
-        user = user_map[user_id]
-        user.download_traffic += d
-        user.upload_traffic += u
-        user.last_use_time = log_time
-        user_model_list.append(user)
-        # 个人流量记录
+
+        # 节点流量增量
+        node_total_traffic += u + d
+
+        # 记录用户占用节点流量
+        if user_id in node_occurred_user_ids:
+            UserProxyNodeOccupancy.check_and_incr_traffic(
+                user_id=user_id, proxy_node_id=node_id, traffic=d + u
+            )
+        else:
+            # 个人流量增量
+            user.download_traffic += d
+            user.upload_traffic += u
+            user.last_use_time = log_time
+            user_model_list.append(user)
+        # 流量记录
         trafficlog_model_list.append(
             UserTrafficLog(
                 proxy_node=node,
@@ -62,21 +76,32 @@ def sync_user_traffic_task(node_id, data):
                 ip_list=user_data.get("ip_list", []),
             )
         )
-        # 节点流量增量
-        node_total_traffic += u + d
 
-    if not data:
+    if not traffic_data:
         # NOTE add blank log to show node is online
         trafficlog_model_list.append(UserTrafficLog(proxy_node=node))
     # 节点流量记录
     node.used_traffic += node_total_traffic
     if node.overflow:
         node.enable = False
-    node.save(update_fields=["used_traffic", "enable"])
+    node.current_used_download_bandwidth_bytes = int(data.get("download_bandwidth", 0))
+    node.current_used_upload_bandwidth_bytes = int(data.get("upload_bandwidth", 0))
+    node.save(
+        update_fields=[
+            "used_traffic",
+            "enable",
+            "current_used_download_bandwidth_bytes",
+            "current_used_upload_bandwidth_bytes",
+        ]
+    )
     # 用户流量
     m.User.objects.bulk_update(
         user_model_list,
-        ["download_traffic", "upload_traffic", "last_use_time"],
+        [
+            "download_traffic",
+            "upload_traffic",
+            "last_use_time",
+        ],
     )
     # 流量记录
     UserTrafficLog.objects.bulk_create(trafficlog_model_list)
